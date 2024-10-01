@@ -1,0 +1,1795 @@
+Description: Create an Object Lambda Access Point for Point In Time restores of S3 buckets
+
+Parameters:
+
+  BucketName:
+    Type: String
+    Description: The Amazon S3 bucket name to be viewed at a Point in Time. Must have versioning enabled.
+    Default: "aws-pgargan-s3-pit-blog"
+
+  TimeStamp:
+    Type: String
+    Description: The Point in Time timestamp required, in ISO format yyyy-mm-ddThh:mm:ss
+    AllowedPattern: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\+\d{2}:\d{2})?
+    ConstraintDescription: Please enter a timestamp in ISO format, e.g. 2023-07-28T12:00:00
+    Default: "2023-07-28T12:00:00"
+
+  Delimiter:
+    Type: String
+    Description: The character used to separate folders, e.g. "/"
+    AllowedPattern: .
+    ConstraintDescription: Please enter a single character, e.g. "/"
+    Default: "/"
+
+  Prefix:
+    Type: String
+    Description: Prefix to focus on. Leave blank for whole bucket.
+    Default: "demofiles/"
+
+  ManifestOnly:
+    Type: String
+    Description: Set to true to only create a Manifest, without the Object Lambda Access Point
+    Default: false
+    AllowedValues:
+      - true
+      - false
+
+Conditions:
+  NotManifestOnly:
+    !Not [!Equals [!Ref ManifestOnly, true]]
+
+Resources:
+
+  AthenaResultsBucket:
+    Type: "AWS::S3::Bucket"
+
+  GlueDatabase:
+    Type: "AWS::Glue::Database"
+    Properties:
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseInput:
+        Name: !Join [ "" , [ "s3_pit_db_", !Join [ "_", !Split ["-", !Select [ 2, !Split [ "/" , !Select [ 5, !Split [ ":", !Ref "AWS::StackId" ] ] ] ] ] ] ] ]
+        Description: "Holds the tables for the S3 Point-in-Time Restore solution"
+
+  ExecuteClean:
+    Type: "Custom::ExecuteCleanerFunction"
+    Properties:
+      ServiceToken: !GetAtt BucketCleaner.Arn
+      Bucket: !Ref AthenaResultsBucket
+
+  InventoryFinder:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.11
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt InventoryFinderRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import json
+          import re
+          import boto3
+          import botocore.exceptions
+          from datetime import datetime
+          
+          def handler(event, context):
+          
+            if event["RequestType"] != "Create":
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            
+            fields = set(["LastModifiedDate", "StorageClass", "ETag", "ChecksumAlgorithm", "ObjectOwner"])
+            inv = response_data = None
+            invs = []
+            
+            bucket = event["ResourceProperties"]["Bucket"]
+            timestamp = datetime.fromisoformat(event["ResourceProperties"]["TimeStamp"])
+            
+            s3 = boto3.client("s3")
+            
+            try:
+              response = s3.list_bucket_inventory_configurations(Bucket = bucket)
+            except botocore.exceptions.ClientError as error:
+              if error.response['Error']['Code'] == "NoSuchBucket":
+                reason = f"Bucket '{bucket}' does not exist."
+              else:
+                reason = f"Error listing inventory configurations for bucket '{bucket}': {error.response['Error']['Message']}"
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+                return
+            
+            while True:
+            
+              bad_prefix = False
+              for inv in response.get("InventoryConfigurationList", []):
+            
+                # We need an inventory in ORC format, that has all object versions,
+                # and contains the fields we're interested in.
+                if (inv["Destination"]["S3BucketDestination"]["Format"] in ["ORC", "Parquet"] and
+                  inv["IncludedObjectVersions"] == "All" and fields.issubset(set(inv["OptionalFields"]))):
+                
+                  # Leading or trailing slashes in prefix used by Inventory breaks Athena.
+                  prefix = inv["Destination"]["S3BucketDestination"]["Prefix"]
+                  if prefix[0] == "/" or prefix[-1] == "/":
+                    bad_prefix = True
+                  else:
+                    invs.append(inv)
+            
+              if not response["IsTruncated"]:
+                break
+              
+              response = s3.list_bucket_inventory_configurations(Bucket = bucket,
+                ContinuationToken = response["NextContinuationToken"])
+            
+            # Now look through all the inventory configurations we found,
+            # and choose one which has a date greater than the timestamp we're interested in.
+            
+            serde_map = {
+              "ORC": "org.apache.hadoop.hive.ql.io.orc.OrcSerde",
+              "Parquet" : "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+            }
+            
+            for inv in invs:
+              
+              d = inv["Destination"]["S3BucketDestination"]
+              inv_bucket = d["Bucket"].split(":")[5]
+              bucket_loc = f'{d["Prefix"]}/' if d.get("Prefix") else ""
+              prefix = f'{bucket_loc}{bucket}/{inv["Id"]}/hive/dt='
+              
+              dates = list(boto3.resource("s3").Bucket(inv_bucket).objects.filter(Prefix = prefix))
+              if len(dates) == 0:
+                continue
+              
+              # Entries are sorted, so the last one is the most recent date.
+              result = re.search("dt=((\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2}))", dates[-1].key)
+              
+              if (result):
+                ts = datetime.fromisoformat(f"{result.group(2)}T{result.group(3)}:{result.group(4)}:00")
+                
+                if ts >= timestamp:
+                  response_data = {
+                    "DateTime" : result.group(1),
+                    "InventoryLocation" : f"s3://{inv_bucket}/{prefix[:-3]}",
+                    "Serde" : serde_map[d["Format"]]
+                  }
+                  break
+            
+            if response_data is None:
+              reason = f"Couldn't find an inventory for bucket '{bucket}' in ORC / Parquet format, "\
+                          f"with fields {fields}, and inventory reports >= {timestamp}"
+              if (bad_prefix):
+                reason += ". At least one inventory was ignored because its destination prefix has a leading or trailing '/' character."
+              
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+              return
+            
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+  InventoryFinderRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource: !Join [ ":", [ "arn:aws:logs", !Ref "AWS::Region", !Ref "AWS::AccountId", "*" ] ]
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Join [ "", [ "arn:", !Ref "AWS::Partition", ":logs:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":log-group:/aws/lambda/*" ] ]
+              - Effect: Allow
+                Action:
+                  - "s3:GetInventoryConfiguration"
+                Resource:
+                  - !Join [ "", [ "arn:", !Ref "AWS::Partition", ":s3:::", !Ref BucketName ] ]
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                Resource:
+                  - "*"
+
+  FindInventory:
+    Type: "Custom::ExecuteFindInventoryFunction"
+    Properties:
+      ServiceToken: !GetAtt InventoryFinder.Arn
+      Bucket: !Ref BucketName
+      TimeStamp: !Ref TimeStamp
+      
+  CreatePITTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table to hold an Amazon S3 Inventory"
+      QueryString: !Sub
+        - |
+          CREATE EXTERNAL TABLE ${GlueDB}.pit_table ( bucket string, key string, version_id string, is_latest boolean, is_delete_marker boolean, size bigint, last_modified_date timestamp, e_tag string, storage_class string, is_multipart_uploaded boolean, replication_status string, encryption_status string, object_lock_retain_until_date timestamp, object_lock_mode string, object_lock_legal_hold_status string, intelligent_tiering_access_tier string, bucket_key_status string, checksum_algorithm string, object_acl string, object_owner string )
+          PARTITIONED BY ( dt string )
+          ROW FORMAT SERDE '${Serde}'
+          STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.SymlinkTextInputFormat'
+          OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat'
+          LOCATION '${InventoryLocation}'
+          TBLPROPERTIES ( "projection.enabled" = "true", "projection.dt.type" = "date", "projection.dt.format" = "yyyy-MM-dd-HH-mm", "projection.dt.range" = "2020-01-01-00-00,NOW", "projection.dt.interval" = "1", "projection.dt.interval.unit" = "HOURS" )
+        - InventoryLocation: !GetAtt FindInventory.InventoryLocation
+          GlueDB: !Ref GlueDatabase
+          Serde: !GetAtt FindInventory.Serde
+
+  CreateAllVersionsTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table to hold just the info needed for LIST, for all file versions"
+      QueryString: !Sub
+        - |
+          CREATE TABLE ${GlueDB}.all_versions WITH (format = 'ORC', external_location = 's3://${ResultsBucket}/all_versions_table/', write_compression = 'SNAPPY') AS SELECT key, version_id, is_delete_marker, to_iso8601(with_timezone(last_modified_date,'Z')) as last_modified_date, size, e_tag, storage_class, checksum_algorithm, object_owner FROM ${GlueDB}.pit_table WHERE dt = '${DateTime}' AND last_modified_date < from_iso8601_timestamp('${TimeStamp}') AND starts_with(key, '${Prefix}')
+        - DateTime: !GetAtt FindInventory.DateTime
+          ResultsBucket: !Ref AthenaResultsBucket
+          GlueDB: !Ref GlueDatabase
+          TimeStamp: !Ref TimeStamp
+          Prefix: !Ref Prefix
+
+  CreateMyVersionsTable:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table to hold only the object versions present at our Point in Time"
+      QueryString: !Sub
+        - |
+          CREATE TABLE ${GlueDB}.my_versions WITH (format = 'ORC', external_location = 's3://${ResultsBucket}/my_versions_table/', write_compression = 'SNAPPY') AS SELECT * FROM (SELECT *, row_number() OVER(PARTITION BY key ORDER BY last_modified_date DESC) AS rn FROM ${GlueDB}.all_versions) WHERE rn=1 AND is_delete_marker = false
+        - ResultsBucket: !Ref AthenaResultsBucket
+          GlueDB: !Ref GlueDatabase
+
+  CreateImportTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: NotManifestOnly
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Amazon Athena table and CSVs for the import into DynamoDB"
+      QueryString: !Sub
+        - |
+          CREATE TABLE ${GlueDB}.import WITH (format = 'TEXTFILE', external_location = 's3://${ResultsBucket}/CSV_Import/Key_List/', field_delimiter = ',', write_compression = 'GZIP') AS SELECT 'x' AS pk, key, cardinality(split(key, '${Delimiter}')) - 1 AS depth, version_id, last_modified_date, size, e_tag, storage_class, checksum_algorithm, object_owner FROM ${GlueDB}.my_versions
+        - ResultsBucket: !Ref AthenaResultsBucket
+          Delimiter: !Ref Delimiter
+          GlueDB: !Ref GlueDatabase
+
+  PrepareS3BatchManifest:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Prepares a key manifest suitable for use with S3 Batch Operations"
+      QueryString: !Sub
+        - |
+          CREATE TABLE ${GlueDB}.manifest WITH (format = 'TEXTFILE', external_location = 's3://${ResultsBucket}/ManifestData/', field_delimiter = ',', write_compression = 'NONE') AS SELECT '${SourceBucket}' as bucket, url_encode(key) as key, version_id FROM ${GlueDB}.my_versions
+        - ResultsBucket: !Ref AthenaResultsBucket
+          GlueDB: !Ref GlueDatabase
+          SourceBucket: !Ref BucketName
+
+  InitialCPQuery:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: NotManifestOnly
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Create the initial Amazon Athena table for the CommonPrefixes table"
+      QueryString: !Sub
+        - |
+          CREATE TABLE ${GlueDB}.cp_0 WITH ( format = 'ORC', external_location = 's3://${ResultsBucket}/CommonPrefixes/data/0/', write_compression = 'SNAPPY' ) AS select distinct if( cardinality(key) = 1, '${Delimiter}', concat_ws('${Delimiter}', trim_array(key, 1)) ) as key, reverse(key)[1] as child from ( select trim_array(split(key, '${Delimiter}'), 1) as key from ${GlueDB}.import where strpos(key, '${Delimiter}') > 0)
+        - ResultsBucket: !Ref AthenaResultsBucket
+          Delimiter: !Ref Delimiter
+          GlueDB: !Ref GlueDatabase
+  
+  NextCPQuery:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: NotManifestOnly
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Create the next Amazon Athena tables for the CommonPrefixes table"
+      QueryString: !Sub
+        - |
+          CREATE TABLE ${GlueDB}.cp_%%LEVEL%% WITH ( format = 'ORC', external_location = 's3://${ResultsBucket}/CommonPrefixes/data/%%LEVEL%%/', write_compression = 'SNAPPY' ) AS select distinct if(cardinality(key) = 1, '${Delimiter}', concat_ws('${Delimiter}', trim_array(key, 1))) as key, reverse(key)[1] as child from (select distinct split(key, '${Delimiter}') as key from ${GlueDB}.cp_%%PREVLEVEL%% where key <> '${Delimiter}')
+        - ResultsBucket: !Ref AthenaResultsBucket
+          Delimiter: !Ref Delimiter
+          GlueDB: !Ref GlueDatabase
+  
+  FinalCPQuery:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: NotManifestOnly
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Create the final Amazon Athena tables for the CommonPrefixes table"
+      QueryString: !Sub
+        - |
+          CREATE TABLE ${GlueDB}.cp_final WITH ( format = 'TEXTFILE', external_location = 's3://${ResultsBucket}/CSV_Import/Common_Prefixes/', field_delimiter = ',' ) AS select distinct * from ( select * from ${GlueDB}.cp_0
+        - ResultsBucket: !Ref AthenaResultsBucket
+          GlueDB: !Ref GlueDatabase
+
+  PrefixMaker:
+    Type: "AWS::Lambda::Function"
+    Condition: NotManifestOnly
+    Properties:
+      Runtime: python3.11
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt AthenaAccessRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import json
+          import time
+          import boto3
+          
+          def handler(event, context):
+          
+              # Only execute on create.
+              if event["RequestType"] != "Create":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              
+              athena = boto3.client("athena")
+              
+              # Get the various query strings we are to use.
+              queries = {}
+              for q in ["Initial", "Next", "Final"]:
+                  id = event["ResourceProperties"][f"{q}QueryID"]
+                  print(f"{q} -> {id}")
+                  queries[q] = athena.get_named_query(NamedQueryId = id)["NamedQuery"]["QueryString"]
+          
+              # Where to place the Athena results
+              results_location = event["ResourceProperties"]["ResultsLocation"]
+              
+              try:
+                  
+                  result_count = run_query(queries["Initial"], results_location)
+                  
+                  if result_count == 0:
+                      reason = "No data found in inventory table. Please confirm at least one inventory report is present."
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+                      return
+                  
+                  level = 1
+                  
+                  while result_count > 0:
+                  
+                      text = queries["Next"]
+                      text = text.replace("%%LEVEL%%", str(level)).replace("%%PREVLEVEL%%", str(level - 1))
+                      
+                      result_count = run_query(text, results_location)
+                      level += 1
+          
+                  # Each query starts "CREATE TABLE tablename AS ..."
+                  # So we can get db name by splitting on space, pulling the 3rd element, then splitting on "."
+                  table_name = text.split(" ", 4)[2]
+                  db_name = table_name.split(".")[0]
+                  
+                  text = queries["Final"]
+                  for l in range(0, level - 1):
+          	        text += f" union select * from {db_name}.cp_{l}"
+                  text += " )"
+              
+                  result_count = run_query(text, results_location)
+          
+                  s3 = boto3.client("s3")
+                  bucket = results_location.split("/")[2]
+                  
+                  # Remove metadata files so we just have CSVs to import.
+                  for p in s3.get_paginator("list_objects_v2").paginate(Bucket = bucket):
+                      for c in p["Contents"]:
+                          if c["Key"].endswith(".metadata"):
+                              r = s3.delete_object(Bucket = bucket, Key = c["Key"])
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              
+              except Exception as e:
+          
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, str(e))
+          
+          def run_query(query_text, results_location):
+              
+              athena = boto3.client("athena")
+              
+              response = athena.start_query_execution(
+          		QueryString = query_text,
+          		ResultConfiguration = { "OutputLocation" : results_location	}
+          	  )
+          	
+              id = response["QueryExecutionId"]
+          
+              status = athena.get_query_execution(QueryExecutionId = id)["QueryExecution"]["Status"]["State"]
+              while status in ["QUEUED", "RUNNING"]:
+                  status = athena.get_query_execution(QueryExecutionId = id)["QueryExecution"]["Status"]["State"]
+                  time.sleep(10)
+          
+              if status != "SUCCEEDED":
+                  raise Exception(f"Query {id} failed with status {status}.")
+              
+              # Now count the results. Each query starts "CREATE TABLE tablename AS ..."
+              # So we can get table name by splitting on space and pulling the 3rd element.
+              table_name = query_text.split(" ", 4)[2]
+              
+              query_text = f"select count(*) as c from {table_name}"
+              response = athena.start_query_execution(
+                  QueryString = query_text,
+                  ResultConfiguration = { "OutputLocation" : results_location	}
+              )
+          	
+              id = response["QueryExecutionId"]
+          
+              status = athena.get_query_execution(QueryExecutionId = id)["QueryExecution"]["Status"]["State"]
+              while status in ["QUEUED", "RUNNING"]:
+                  status = athena.get_query_execution(QueryExecutionId = id)["QueryExecution"]["Status"]["State"]
+                  time.sleep(10)
+          
+              if status != "SUCCEEDED":
+                  raise Exception(f"Query {id} failed with status {status}.")
+          
+              response = athena.get_query_results(QueryExecutionId = id)
+          	
+              return int(response["ResultSet"]["Rows"][1]["Data"][0]["VarCharValue"])	
+          
+  ExecutePrefixMaker:
+    Type: "Custom::ExecutePrefixMaker"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateImportTable
+    Condition: NotManifestOnly
+    Properties:
+      ServiceToken: !GetAtt PrefixMaker.Arn
+      InitialQueryID: !GetAtt InitialCPQuery.NamedQueryId
+      NextQueryID: !GetAtt NextCPQuery.NamedQueryId
+      FinalQueryID: !GetAtt FinalCPQuery.NamedQueryId
+      ResultsLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/ExecutePrefixMaker/" ] ]
+
+  BucketCleaner:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.11
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt BucketCleanerRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+            
+          def handler(event, context):
+            
+            if event["RequestType"] != "Delete":
+              status = {
+                "Status" : f'Exiting on RequestType = {event["RequestType"]}',
+                "Event" : event
+              }
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
+              return
+            
+            bucket = event["ResourceProperties"]["Bucket"]
+            s3 = boto3.client("s3")
+            
+            try:
+              response = s3.head_bucket(Bucket = bucket)
+            except Exception as e:
+              status = {
+                "Status" : f'Exiting due to error = {e}',
+                "Event" : event
+              }
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
+              return
+            
+            count = 0
+            total = 0
+            
+            for p in s3.get_paginator('list_objects_v2').paginate(Bucket = bucket):
+            
+              keys = [ {"Key" : c["Key"] } for c in p.get("Contents", []) ]
+                
+              if keys:
+                total += len(keys)                
+                response = s3.delete_objects(Bucket = bucket, Delete = { "Objects" : keys })
+                count += len(response.get("Deleted", []))
+                
+            status = { "Status" : f'Deleted {count} / {total} keys.' }
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, status)
+
+  BucketCleanerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource: !Join [ ":", [ "arn:aws:logs", !Ref "AWS::Region", !Ref "AWS::AccountId", "*" ] ]
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Join [ "", [ "arn:", !Ref "AWS::Partition", ":logs:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":log-group:/aws/lambda/*" ] ]
+              - Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !Join [ "", [ !GetAtt AthenaResultsBucket.Arn, "/*" ] ]
+                  
+  QueryExecutor:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.11
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt AthenaAccessRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import json
+          import time
+          import boto3
+          import re
+          
+          def handler(event, context):
+          
+              # Only execute on create.
+              if event["RequestType"] != "Create":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+                  
+              query_id = event["ResourceProperties"]["QueryID"]
+              
+              # Where to place the results
+              results_location = event["ResourceProperties"]["ResultsLocation"]
+              
+              s3 = boto3.client("s3")
+              athena = boto3.client("athena")
+              
+              query = athena.get_named_query(NamedQueryId = query_id)
+              
+              response = athena.start_query_execution(
+                  QueryString = query["NamedQuery"]["QueryString"],
+                  ResultConfiguration = { "OutputLocation" : results_location }
+              )
+              
+              execution_id = response["QueryExecutionId"]
+              response = athena.get_query_execution(QueryExecutionId = execution_id)
+              
+              # Wait for query to finish.
+              while response["QueryExecution"]["Status"]["State"] in ["QUEUED", "RUNNING"]:
+                  
+                  time.sleep(5)
+                  response = athena.get_query_execution(QueryExecutionId = execution_id)
+              
+              (bucket, prefix) = results_location[5:].split("/", 1)
+              
+              # Remove metadata files so we just have CSVs to import.
+              for p in s3.get_paginator("list_objects_v2").paginate(Bucket = bucket, Prefix = prefix):
+                  for c in p["Contents"]:
+                      
+                      if c["Key"].endswith(".metadata"):
+                          r = s3.delete_object(Bucket = bucket, Key = c["Key"])
+              
+              if response["QueryExecution"]["Status"]["State"] == "SUCCEEDED":
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              
+              else:
+                  reason = str(response["QueryExecution"]["Status"]["AthenaError"])
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+          
+  AthenaAccessRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource: !Join [ ":", [ "arn:aws:logs", !Ref "AWS::Region", !Ref "AWS::AccountId", "*" ] ]
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Join [ "", [ "arn:", !Ref "AWS::Partition", ":logs:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":log-group:/aws/lambda/*" ] ]
+              - Effect: Allow
+                Action:
+                  - "athena:GetNamedQuery"
+                  - "athena:StartQueryExecution"
+                  - "athena:GetQueryExecution"
+                  - "athena:GetQueryResults"
+                Resource:
+                  - !Join [ "", [ "arn:", !Ref "AWS::Partition", ":athena:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":workgroup/*" ] ]
+              - Effect: Allow
+                Action:
+                  - "glue:CreateDatabase"
+                  - "glue:CreateTable"
+                  - "glue:GetTable"
+                Resource:
+                  - !Join [ "", [ "arn:", !Ref "AWS::Partition", ":glue:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":catalog" ] ]
+                  - !Join [ "", [ "arn:", !Ref "AWS::Partition", ":glue:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":database/*" ] ]
+                  - !Join [ "", [ "arn:", !Ref "AWS::Partition", ":glue:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":table/*" ] ]
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:ListMultipartUploadParts"
+                  - "s3:AbortMultipartUpload"
+                Resource:
+                  - "*"
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !Join [ "", [ !GetAtt AthenaResultsBucket.Arn, "/*" ] ]
+              - Effect: Allow
+                Action:
+                  - "s3:GetBucketLocation"
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+        
+  ManifestMaker:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Runtime: python3.11
+      Timeout: 900
+      Handler: "index.handler"
+      Role: !GetAtt ManifestMakerRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import concurrent.futures
+          import time
+          import json
+          import uuid
+          import boto3
+          import boto3.session
+          import botocore
+          import botocore.config
+          import re
+          
+          # Takes a list of S3 keys and combines them into files of >= 5MB. Deletes the old keys.
+          def combine(s3, bucket, prefix, keys):
+          	
+          	# Special case. Only received 1 file? Just return it unchanged.
+          	if len(keys) == 1:
+          	    return keys
+          	
+          	buffer = bytearray()
+          	key_count = 0
+          	new_names = []
+          	
+          	for k in keys:
+          		
+          		key_count += 1
+          		response = s3.get_object(Bucket = bucket, Key = k)
+          		buffer.extend(response["Body"].read())
+          
+          		# Have we collected more than 5MB?
+          		if len(buffer) >= 5*1024*1024:
+          			new_names += [ write_object(s3, bucket, prefix, buffer) ]
+          			buffer = bytearray() # Empty the buffer
+          			key_count = 0
+          
+          	# One file left, just return it intact.
+          	if key_count == 1:
+          		new_names += [ k ]
+          	
+          	# Multiple files left in buffer. Combine them.
+          	elif key_count > 1:
+          		new_names += [ write_object(s3, bucket, prefix, buffer) ]
+          	
+          	return new_names
+          
+          # Writes an object with a new, random name.
+          def write_object(s3, bucket, prefix, bytes):
+              
+          	name = f"{prefix}{uuid.uuid4()}-{time.time()}.dat" # Random name.
+          	response = s3.put_object(Bucket = bucket, Key = name, Body = bytes)
+          	
+          	return name
+          
+          def handler(event, context):
+              
+              # Only execute on create.
+              if event["RequestType"] != "Create":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              
+              csv_location = event["ResourceProperties"]["SourceLocation"]
+              
+              result = re.search("^s3://(.+?)/(.+)", csv_location)
+              bucket = result.group(1)
+              prefix = result.group(2)
+              key = f"Manifest/manifest.csv"
+              
+              session = boto3.session.Session()
+              s3 = session.client("s3")
+              
+              try:
+                  response = s3.create_multipart_upload(
+                      Bucket = bucket,
+                      Key = key
+                  )
+                  
+                  upload_id = response["UploadId"]
+                  
+                  src_keys = []
+                  combine_keys = []
+                  for p in s3.get_paginator("list_objects_v2").paginate(Bucket = bucket, Prefix = prefix):
+                      for c in p["Contents"]:
+                      
+                          if c["Size"] < 5*1024*1024:
+                              combine_keys += [ c["Key"] ]
+                          else:
+                              src_keys += [ c["Key"] ]
+          
+                  # Combine any parts < 5MB into objects of at least 5MB.    
+                  src_keys += combine(s3, bucket, prefix, combine_keys)
+          
+                  # Create a new S3 client, but this time with enough pooled connections + headroom
+                  # to upload all parts in parallel.
+                  config = botocore.config.Config(max_pool_connections = int(len(src_keys) * 1.25))
+                  s3 = session.client("s3", config = config)
+          
+                  # Create a seperate thread for each part being uploaded.
+                  part = 1
+                  futures = []
+                  executor = concurrent.futures.ThreadPoolExecutor(max_workers = len(src_keys))
+                  for k in src_keys:
+                      futures += [ executor.submit(upload_part, s3, bucket, key, { "Bucket" : bucket, "Key" : k } , part, upload_id) ]
+                      part += 1
+              
+                  parts = []
+                  for r in concurrent.futures.as_completed(futures):
+                      parts += [ r.result() ]
+              
+                  parts.sort(key = lambda e: e["PartNumber"])
+              
+                  response = s3.complete_multipart_upload(
+                      Bucket = bucket,
+                      Key = key,
+                      MultipartUpload = { "Parts" : parts },
+                      UploadId = upload_id
+                  )
+              
+                  response_data = { "Manifest" : f"s3://{bucket}/{prefix}manifest.csv" }
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  
+              except botocore.exceptions.ClientError as e:
+                  reason = f'S3 processing failed with {e.response["Error"]["Code"]}: {e.response["Error"]["Message"]}'
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
+              
+          def upload_part(s3, bucket, key, src, part, upload_id):
+              
+              response = s3.upload_part_copy(
+                  Bucket = bucket,
+                  Key = key,
+                  CopySource = src,
+                  PartNumber = part,
+                  UploadId = upload_id
+              )
+              
+              return { "ETag" : response["CopyPartResult"]["ETag"], "PartNumber" : part }
+              
+  ManifestMakerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource: !Join [ ":", [ "arn:aws:logs", !Ref "AWS::Region", !Ref "AWS::AccountId", "*" ] ]
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Join [ "", [ "arn:", !Ref "AWS::Partition", ":logs:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":log-group:/aws/lambda/*" ] ]
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !GetAtt AthenaResultsBucket.Arn
+                  - !Join [ "", [ !GetAtt AthenaResultsBucket.Arn, "/*" ] ]
+        
+  ExecuteCreatePITTable:
+    Type: "Custom::ExecuteCreatePITTableFunction"
+    DependsOn:
+    - ExecuteClean
+    Properties:
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreatePITTable.NamedQueryId
+      ResultsLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/CreatePITTable/"]]
+
+  ExecuteCreateAllVersionsTable:
+    Type: "Custom::ExecuteCreateAllVersionsTable"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreatePITTable
+    Properties:
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateAllVersionsTable.NamedQueryId
+      ResultsLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/CreateAllVersionsTable/"]]
+
+  ExecuteCreateMyVersionsTable:
+    Type: "Custom::ExecuteCreateMyVersionsTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateAllVersionsTable
+    Properties:
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateMyVersionsTable.NamedQueryId
+      ResultsLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/CreateMyVersionsTable/"]]
+
+  ExecuteCreateImportTable:
+    Type: "Custom::ExecuteCreateImportTableFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateMyVersionsTable
+    Condition: NotManifestOnly
+    Properties:
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateImportTable.NamedQueryId
+      ResultsLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/CreateImportTable/"]]
+
+  ExecutePrepareS3BatchManifest:
+    Type: "Custom::ExecutePrepareS3BatchManifestFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateMyVersionsTable
+    Properties:
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt PrepareS3BatchManifest.NamedQueryId
+      ResultsLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/PrepareManifest/"]]
+
+  ExecuteManifestMaker:
+    Type: "Custom::ExecuteManifestMakerFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateMyVersionsTable
+    - ExecutePrepareS3BatchManifest
+    Properties:
+      ServiceToken: !GetAtt ManifestMaker.Arn
+      SourceLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/ManifestData/"]]
+
+  KeyListDDBTable:
+    Type: "AWS::DynamoDB::Table"
+    DependsOn:
+    -  ExecuteCreateImportTable
+    Condition: NotManifestOnly
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "pk"
+          AttributeType: "S"
+        -
+          AttributeName: "key"
+          AttributeType: "S"
+        -
+          AttributeName: "depth"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "pk"
+          KeyType: "HASH"
+        -
+          AttributeName: "key"
+          KeyType: "RANGE"
+      BillingMode: "PAY_PER_REQUEST"
+      GlobalSecondaryIndexes:
+        -
+          IndexName: "DepthIndex"
+          KeySchema:
+            -
+              AttributeName: "depth"
+              KeyType: "HASH"
+            -
+              AttributeName: "key"
+              KeyType: "RANGE"
+          Projection:
+            ProjectionType: "ALL"
+      ImportSourceSpecification:
+        InputFormat: "CSV"
+        InputFormatOptions:
+          Csv:
+            HeaderList:
+              - pk
+              - key
+              - depth
+              - version_id
+              - last_modified_date
+              - size
+              - e_tag
+              - storage_class
+              - checksum_algorithm
+              - object_owner
+        InputCompressionType: "GZIP"
+        S3BucketSource:
+          S3Bucket: !Ref AthenaResultsBucket
+          S3KeyPrefix: "CSV_Import/Key_List/"
+
+  CommonPrefixesDDBTable:
+    Type: "AWS::DynamoDB::Table"
+    DependsOn:
+    -  ExecutePrefixMaker
+    Condition: NotManifestOnly
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "key"
+          AttributeType: "S"
+        -
+          AttributeName: "child"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "key"
+          KeyType: "HASH"
+        -
+          AttributeName: "child"
+          KeyType: "RANGE"
+      BillingMode: "PAY_PER_REQUEST"
+      ImportSourceSpecification:
+        InputFormat: "CSV"
+        InputFormatOptions:
+          Csv:
+            HeaderList:
+              - key
+              - child
+        InputCompressionType: "GZIP"
+        S3BucketSource:
+          S3Bucket: !Ref AthenaResultsBucket
+          S3KeyPrefix: "CSV_Import/Common_Prefixes/"
+
+  S3AccessPoint:
+    Type: "AWS::S3::AccessPoint"
+    Condition: NotManifestOnly
+    Properties: 
+      Name: !Join [ "", [ "pit-ap-", !Select [ 2, !Split [ "/", !Select [ 5, !Split [ ":", !Ref "AWS::StackId" ] ] ] ] ] ]
+      Bucket: !Ref BucketName
+      Policy:
+        Version: 2012-10-17
+        Statement:
+          - Sid: "DenyWrite"
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - "s3:DeleteObject*"
+              - "s3:PutObject*"
+              - "s3:AbortMultipartUpload"
+              - "s3:RestoreObject"
+            Resource:
+              - !Join [ "", [ "arn:", !Ref "AWS::Partition", ":s3:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":accesspoint/", !Join [ "", [ "pit-ap-", !Select [ 2, !Split [ "/", !Select [ 5, !Split [ ":", !Ref "AWS::StackId" ] ] ] ] ] ], "/object/*" ] ]
+
+  ObjectLambdaAccessPoint:
+    Type: "AWS::S3ObjectLambda::AccessPoint"
+    Condition: NotManifestOnly
+    Properties: 
+      ObjectLambdaConfiguration:
+        AllowedFeatures:
+          - GetObject-Range
+          - GetObject-PartNumber
+          - HeadObject-Range
+          - HeadObject-PartNumber
+        SupportingAccessPoint: !GetAtt S3AccessPoint.Arn
+        TransformationConfigurations:
+          -
+            Actions:
+              - GetObject
+              - HeadObject
+              - ListObjects
+              - ListObjectsV2
+            ContentTransformation:
+              AwsLambda:
+                FunctionArn: !GetAtt ObjectLambdaFunction.Arn
+
+  ObjectLambdaAccessPointPolicy:
+    Type: "AWS::S3ObjectLambda::AccessPointPolicy"
+    Condition: NotManifestOnly
+    Properties:
+      ObjectLambdaAccessPoint: !Ref ObjectLambdaAccessPoint
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: "DenyWrite"
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - "s3-object-lambda:DeleteObject*"
+              - "s3-object-lambda:PutObject*"
+              - "s3-object-lambda:AbortMultipartUpload"
+              - "s3-object-lambda:RestoreObject"
+            Resource:
+              - !GetAtt ObjectLambdaAccessPoint.Arn
+      
+  ObjectLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Condition: NotManifestOnly
+    Properties:
+      Runtime: python3.11
+      Timeout: 60
+      Handler: "index.handler"
+      Role: !GetAtt ObjectLambdaFunctionRole.Arn
+      Environment:
+        Variables:
+          BUCKET: !Ref BucketName
+          KL_TABLE: !Ref KeyListDDBTable
+          CP_TABLE: !Ref CommonPrefixesDDBTable
+          DELIMITER: !Ref Delimiter
+          TIMESTAMP: !Ref TimeStamp
+      MemorySize: 10240
+      Code:
+        ZipFile: |
+          import re
+          import os
+          import io
+          import boto3
+          import json
+          from boto3.dynamodb.conditions import Key
+          from base64 import b64encode, b64decode
+          from urllib.parse import quote, unquote, urlparse, parse_qs
+          from datetime import datetime
+          
+          def handler(event, context):
+          
+              # Extract the different parameters passed into us.
+              url = urlparse(unquote(event["userRequest"]["url"]))
+              params = parse_qs(url.query, keep_blank_values=True)
+              key = url.path[1:] # Remove leading slash.
+              range = event["userRequest"]["headers"].get("Range", None) or params.get("Range", None)
+              part = params.get("partNumber", [None])[0]
+          
+              # GET
+              if "getObjectContext" in event:
+                  
+                  # Find out where to write the object to.
+                  route = event["getObjectContext"]["outputRoute"]
+                  token = event["getObjectContext"]["outputToken"]
+                  
+                  # Find and write it out.
+                  return do_get(key, range, part, route, token)
+              
+              # HEAD
+              elif "headObjectContext" in event:
+                  
+                  # Find and return headers
+                  return do_head(key, range, part)
+                  
+              # LISTv1
+              elif "listObjectsContext" in event:
+                  
+                  # Extract parameters. The following calls, not supported by Object Lambda,
+                  # will also get passed to this endpoint:
+                  
+                  # GetBucketVersioning: GET /?versioning
+                  # GetObjectLockConfiguration: GET /?object-lock
+                  # etc.
+          
+                  unsupported = [
+                      "accelerate",
+                      "encryption",
+                      "lifecycle",
+                      "logging",
+                      "object-lock",
+                      "ownershipControls",
+                      "policyStatus",
+                      "replication",
+                      "requestPayment",
+                      "tagging",
+                      "versioning",
+                      "website"
+                  ]
+                  
+          
+                  # Below should really be a 501 NotImplemented, but Object Lambda doesn't seem to like that.
+                  for u in unsupported:
+                      if u in params:
+                          return {
+                              "statusCode" : 403,
+                              "errorCode" : "Forbidden",
+                              "errorMessage" : "Object Lambda Access Points do not support this API."
+                          }
+                  
+                  # Get this far and it's a normal LISTv1.
+                  
+                  prefix = params.get("prefix", [None])[0]
+                  delimiter = params.get("delimiter", [None])[0]
+                  marker = params.get("marker", [None])[0]
+                  maxkeys = int(params.get("max-keys", ["1000"])[0])
+          
+                  # Return a listing showing only prefixes present at this time.
+                  return do_list_v1(prefix, delimiter, marker, maxkeys)
+          
+              # LISTv2
+              elif "listObjectsV2Context" in event:
+                  
+                  prefix = params.get("prefix", [None])[0]
+                  delimiter = params.get("delimiter", [None])[0]
+                  token = params.get("continuation-token", [None])[0]
+                  maxkeys = int(params.get("max-keys", ["1000"])[0])
+          
+                  # Return a listing showing only prefixes present at this time.
+                  return do_list_v2(prefix, delimiter, token, maxkeys)
+          
+          """
+          
+          Find a version of a given object at a specified time, and write it to the location specified by route and token
+          
+          """
+          
+          def do_get(key, range, part, route, token):
+              
+              s3 = boto3.client("s3")
+              
+              version_id = find_key_version(key)
+              
+              if version_id is None: # A deleted / non-existent file
+                  s3.write_get_object_response(RequestRoute = route, RequestToken = token, StatusCode = 404,
+                      ErrorCode = "FileNotFound", ErrorMessage = f"The key '{key}' did not exist at {os.environ['TIMESTAMP']}.")
+                  return { "status_code" : 404 }
+              
+              
+              kwargs = {
+                  "Bucket" : os.environ["BUCKET"],
+                  "Key" : key,
+                  "VersionId" : version_id
+              }
+              
+              if range:
+                  kwargs |= { "Range" : range }
+                  
+              if part:
+                  kwargs |= { "PartNumber" : int(part) }
+              
+              """
+              TODO: This code reads the entire file into memory before passing it to write_get_object_response
+              Instead, we should try wrapping a seekable class around it.
+              Example: https://alexwlchan.net/2019/working-with-large-s3-objects/
+              What are the implications of using a 3rd-party idea in a public blog post? It's under a MIT licence.
+              
+              Another option is to create a seekable wrapper: https://gist.github.com/obskyr/b9d4b4223e7eaf4eedcd9defabb34f13
+              This is under the "Unlicence"
+              """
+              
+              response = s3.get_object(**kwargs)
+              response.pop("ResponseMetadata", None)
+              bytes = io.BytesIO(response["Body"].read())
+          
+              response |= {
+                  "RequestRoute" : route,
+                  "RequestToken" : token,
+                  "Body" : bytes
+              }
+              
+              
+              s3.write_get_object_response(**response)
+              
+              return {
+                  "status_code" : 200
+              }
+          
+          """
+          
+          Find a version of a given object at a specified time, and return its headers.
+          
+          """
+          
+          def do_head(key, range, part):
+              
+              s3 = boto3.client("s3")
+              
+              # Find the latest version at or before the given timestamp.
+              # This should return either a version_id. It will return None if the latest version is a DeleteMarker, or it doesn't exist at all.
+              
+              version_id = find_key_version(key)
+              
+              if version_id is None: # A deleted / non-existent file
+              
+                  return {
+                      "statusCode" : 404,
+                      "errorCode" : "FILENOTFOUND",
+                      "errorMessage" : f"The key '{key}' did not exist at {os.environ['TIMESTAMP']}."
+                  }
+              
+              kwargs = {
+                  "Bucket" : os.environ["BUCKET"],
+                  "Key" : key,
+                  "VersionId" : version_id
+              }
+              
+              if range:
+                  kwargs |= { "Range" : range }
+                  
+              if part:
+                  kwargs |= { "PartNumber" : int(part) }
+              
+              response = s3.head_object(**kwargs)
+                  
+              return {
+                  "statusCode" : response["ResponseMetadata"]["HTTPStatusCode"],
+                  "headers" : response["ResponseMetadata"]["HTTPHeaders"]
+              }
+              
+          """
+          
+          Return a V1 listing of a bucket's prefix as it was at a given time.
+          
+          """
+          
+          def do_list_v1(prefix, delimiter, marker, maxkeys):
+          
+              # The response object
+              list_bucket_result = {
+                  "name" : os.environ["BUCKET"],
+                  "marker" : (marker or ""),
+                  "prefix" : (prefix or ""),
+                  "maxKeys" : maxkeys,
+                  "encodingType": "url"
+              }
+              
+              if delimiter: list_bucket_result["delimiter"] = delimiter
+              
+              if maxkeys == 0: # Special case used by some clients to test access to bucket.
+                  list_bucket_result["isTruncated"] = False
+                  return  {
+                      "statusCode" : 200,
+                      "listBucketResult" : list_bucket_result
+                  }
+              
+              # If we were passed a delimiter, ensure it's the one that was specified in the CloudFormation.
+              if delimiter:
+                  
+                  valid_delimiter = os.environ["DELIMITER"]
+                  if delimiter != valid_delimiter:
+                      return  {
+                          "statusCode" : 400,
+                          "errorCode" : "InvalidRequest",
+                          "errorMessage" : f"Delimiter '{delimiter}' does not match '{valid_delimiter}' set at deployment time."
+                      }
+          
+              keycount = 0
+              
+              #
+              # If we were passed no marker, or one that doesn't end with the delimiter, we should query the Key List
+              #
+              
+              if (marker is None or marker[-1] != delimiter):
+              
+                  # Find the list of keys, starting with prefix, that were present at a given time.
+                  response = find_prefix_versions_v1(prefix, delimiter, marker, maxkeys)
+          
+                  # Only return a Next Marker if one exists *and* we were passed in a delimiter
+                  # Ref: https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjects.html#AmazonS3-ListObjects-response-NextMarker
+          
+                  if response["Marker"] and delimiter: list_bucket_result["nextMarker"] = quote(response["Marker"])
+          
+                  # If we got a key list back, add it to the response
+                  if response["Results"]:
+                      list_bucket_result["contents"] = response["Results"]
+                      keycount = len(response["Results"])
+          
+                  # Did we receive a truncated response?        
+                  list_bucket_result["isTruncated"] = (response["Marker"] is not None)
+                  
+                  # If it's a truncated response, or we've reached maxkeys, or there's no delimiter, return what we have so far.
+                  if (list_bucket_result["isTruncated"] or keycount == maxkeys or delimiter is None):
+                  
+                      return  {
+                          "statusCode" : 200,
+                          "listBucketResult" : list_bucket_result
+                      }
+                      
+                  # We're continuing to find Common Prefixes. Ensure we don't try to interpret our Key List token as a Common Prefix token.
+                  marker = None
+          
+              #
+              # Otherwise, keep going and check for Common Prefixes.
+              #
+              
+              response = find_common_prefixes_v1(prefix, delimiter, marker, (maxkeys - keycount))
+          
+              if response["Results"]:
+                  list_bucket_result["commonPrefixes"] = response["Results"]
+          
+              # Did we receive a truncated response?        
+              list_bucket_result["isTruncated"] = (response["Marker"] is not None)
+          
+              # Only return a Next Marker if one exists *and* we were passed in a delimiter
+              # Ref: https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjects.html#AmazonS3-ListObjects-response-NextMarker
+          
+              if response["Marker"] and delimiter: list_bucket_result["nextMarker"] = quote(response["Marker"])
+          
+              return  {
+                  "statusCode" : 200,
+                  "listBucketResult" : list_bucket_result
+              }
+          
+          """
+          
+          Return a V2 listing of a bucket's prefix as it was at a given time.
+          
+          """
+          
+          def do_list_v2(prefix, delimiter, token, maxkeys):
+          
+              # The response object
+              list_bucket_result = {
+                  "name" : os.environ["BUCKET"],
+                  "prefix" : (prefix or ""),
+                  "keyCount" : 0,
+                  "maxKeys" : maxkeys,
+                  "encodingType": "url"
+              }
+              
+              if delimiter: list_bucket_result["delimiter"] = delimiter
+              
+              if maxkeys == 0: # Special case used by some clients to test access to bucket.
+                  list_bucket_result["isTruncated"] = False
+                  return  {
+                      "statusCode" : 200,
+                      "listBucketResult" : list_bucket_result
+                  }
+          
+          # If we were passed a delimiter, ensure it's the one that was specified in the CloudFormation.
+              if delimiter:
+                  
+                  valid_delimiter = os.environ["DELIMITER"]
+                  if delimiter != valid_delimiter:
+                      return  {
+                          "statusCode" : 400,
+                          "errorCode" : "InvalidRequest",
+                          "errorMessage" : f"Delimiter '{delimiter}' does not match '{valid_delimiter}' set at deployment time."
+                      }
+          
+              # Return any token that was passed into us initially
+              if token: list_bucket_result["continuationToken"] = token
+          
+              #
+              # If we were passed no token, or one that's prepended with "KL@@", we should query the Key List.
+              #
+              
+              if (token is None or token[:4] == "KL@@"):
+              
+                  if token: token = token[4:] # Discard the token type characters.
+          
+                  # Find the list of keys, starting with prefix, that were present at a given time.
+                  # But skip past the "KL@@"" at the start.
+                  response = find_prefix_versions_v2(prefix, delimiter, token, maxkeys)
+          
+                  # If we got a continuation token, pass it back to the caller.
+                  # But prepend "KL@@" to mark it as a key list token.
+                  if response["Token"]: list_bucket_result["nextContinuationToken"] = f'KL@@{response["Token"]}'
+          
+                  # If we got a key list back, add it to the response
+                  if response["Results"]:
+                      list_bucket_result["contents"] = response["Results"]
+                      list_bucket_result["keyCount"] = len(response["Results"])
+          
+                  # Did we receive a truncated response?        
+                  list_bucket_result["isTruncated"] = (response["Token"] is not None)
+                  
+                  # If it's a truncated response, or we've reached maxkeys, or there's no delimiter, return what we have so far.
+                  if (list_bucket_result["isTruncated"] or list_bucket_result["keyCount"] == maxkeys or delimiter is None):
+                  
+                      return  {
+                          "statusCode" : 200,
+                          "listBucketResult" : list_bucket_result
+                      }
+                      
+                  # We're continuing to find Common Prefixes. Ensure we don't try to interpret our Key List token as a Common Prefix token.
+                  token = None
+          
+              #
+              # Otherwise, keep going and check for Common Prefixes.
+              #
+              
+              if token: token = token[4:] # Discard the token type characters
+              
+              response = find_common_prefixes_v2(prefix, delimiter, token, (maxkeys - list_bucket_result["keyCount"]))
+          
+              if response["Results"]:
+                  list_bucket_result["commonPrefixes"] = response["Results"]
+                  list_bucket_result["keyCount"] += len(response["Results"])
+              
+              # Did we receive a truncated response?        
+              list_bucket_result["isTruncated"] = (response["Token"] is not None)
+          
+              # If we got a continuation token, pass it back to the caller.
+              # But prepend "CP@@" to mark it as a key list token.
+              if response["Token"]: list_bucket_result["nextContinuationToken"] = f'CP@@{response["Token"]}'
+          
+              return  {
+                  "statusCode" : 200,
+                  "listBucketResult" : list_bucket_result
+              }
+              
+          """
+          
+          Determine which version of an object was current at a given timestamp, and its size.
+          
+          """
+          
+          def find_key_version(key):
+              
+              ddb = boto3.client("dynamodb")
+              
+              response = ddb.get_item(
+                  TableName = os.environ["KL_TABLE"],
+                  Key = {
+                      "pk" : { "S" : "x" },
+                      "key" : { "S" : key }
+                  },
+                  ConsistentRead = False,
+                  ProjectionExpression = "version_id"
+              )
+              
+              id = response["Item"]["version_id"]["S"] if "Item" in response else None
+              return id
+              
+          """
+          
+          Return a V1 directory listing as it was at a given time.
+          
+          """
+          
+          def find_prefix_versions_v1(prefix, delimiter, marker, maxkeys):
+              
+              ddb = boto3.client("dynamodb")
+               
+              kwargs = {
+                  "TableName" : os.environ["KL_TABLE"],
+                  "Limit" : maxkeys,
+                  "ConsistentRead" : False
+              }
+              
+              if delimiter:
+                  
+                  depth = prefix.count(delimiter) if prefix else 0
+                  kwargs |= {
+                      "IndexName" : "DepthIndex",
+                      "KeyConditionExpression" : "#depth = :depth",
+                      "ExpressionAttributeNames" : { "#depth" : "depth" },
+                      "ExpressionAttributeValues" : { ":depth" : { "S" : str(depth) } }
+                  }
+                      
+              else:
+                  
+                  kwargs |= {
+                      "KeyConditionExpression" : "#pk = :pk",
+                      "ExpressionAttributeNames" : { "#pk" : "pk" },
+                      "ExpressionAttributeValues" : { ":pk" : { "S" : "x" } }
+                  }
+              
+              if prefix:
+                  
+                  kwargs["KeyConditionExpression"] += " AND begins_with(#k, :key)"
+                  kwargs["ExpressionAttributeNames"]["#k"] = "key"
+                  kwargs["ExpressionAttributeValues"][":key"] = { "S" : prefix }
+          
+              if marker:
+          
+                  kwargs["ExclusiveStartKey"] = {
+                      "pk" : {
+                          "S" : "x"
+                      },
+                      "key" : {
+                          "S" : marker
+                      }
+                  }
+                  
+                  if delimiter:
+                      kwargs["ExclusiveStartKey"] |= {
+                          "depth" : {
+                              "S" : str(marker.count(delimiter))
+                          }
+                      }
+          
+              response = ddb.query(**kwargs)
+              
+              results = [
+                  {
+                          "key" : i["key"]["S"],
+                          "lastModified" : i["last_modified_date"]["S"],
+                          "eTag" : f'"{i["e_tag"]["S"]}"',
+                          # "checksumAlgorithm" : i["checksum_algorithm"]["S"]),
+                          "size" : int(i["size"]["S"]),
+                          "storageClass" : i["storage_class"]["S"]                        
+                  } for i in response["Items"]
+              ]
+              
+              # Pass back any Next Marker needed.
+              if "LastEvaluatedKey" in response:
+                  marker = quote(response["LastEvaluatedKey"]["key"]["S"])
+              else:
+                  marker = None
+              
+              return {
+                  "Results" : results,
+                  "Marker" : marker
+              }
+          
+          """
+          
+          Return a V2 directory listing as it was at a given time.
+          
+          """
+          
+          def find_prefix_versions_v2(prefix, delimiter, token, maxkeys):
+              
+              ddb = boto3.client("dynamodb")
+               
+              kwargs = {
+                  "TableName" : os.environ["KL_TABLE"],
+                  "Limit" : maxkeys,
+                  "ConsistentRead" : False
+              }
+              
+              if delimiter:
+                  
+                  depth = prefix.count(delimiter) if prefix else 0
+                  kwargs |= {
+                      "IndexName" : "DepthIndex",
+                      "KeyConditionExpression" : "#depth = :depth",
+                      "ExpressionAttributeNames" : { "#depth" : "depth" },
+                      "ExpressionAttributeValues" : { ":depth" : { "S" : str(depth) } }
+                  }
+                      
+              else:
+                  
+                  kwargs |= {
+                      "KeyConditionExpression" : "#pk = :pk",
+                      "ExpressionAttributeNames" : { "#pk" : "pk" },
+                      "ExpressionAttributeValues" : { ":pk" : { "S" : "x" } }
+                  }
+              
+              if prefix:
+                  
+                  kwargs["KeyConditionExpression"] += " AND begins_with(#k, :key)"
+                  kwargs["ExpressionAttributeNames"]["#k"] = "key"
+                  kwargs["ExpressionAttributeValues"][":key"] = { "S" : prefix }
+          
+              if token: kwargs["ExclusiveStartKey"] = json.loads(b64decode(token).decode())
+              
+              response = ddb.query(**kwargs)
+              
+              results = [
+                  {
+                          "key" : i["key"]["S"],
+                          "lastModified" : i["last_modified_date"]["S"],
+                          "eTag" : f'"{i["e_tag"]["S"]}"',
+                          # "checksumAlgorithm" : i["checksum_algorithm"]["S"]),
+                          "size" : int(i["size"]["S"]),
+                          "storageClass" : i["storage_class"]["S"]                        
+                  } for i in response["Items"]
+              ]
+              
+              if "LastEvaluatedKey" in response:
+                  token = b64encode(bytes(json.dumps(response["LastEvaluatedKey"]), "utf-8")).decode()
+              else:
+                  token = None
+              
+              return {
+                  "Results" : results,
+                  "Token" : token
+              }
+          
+          """
+          
+          Find the Common Prefixes beneath a given prefix, for V2
+          
+          """
+          
+          def find_common_prefixes_v1(prefix, delimiter, marker, maxkeys):
+              
+              ddb = boto3.client("dynamodb")
+          
+              if prefix:
+                  # Split the prefix along the delimiter.
+                  (key, child) = prefix.rsplit(delimiter, 1) if delimiter in prefix else [delimiter, prefix]
+              
+              else:
+                  (key, child) = [delimiter, None]
+          
+              kwargs = {
+                  "TableName" : os.environ["CP_TABLE"],
+                  "Limit" : maxkeys,
+                  "ConsistentRead" : False,
+                  "KeyConditionExpression" : "#key = :key",
+                  "ExpressionAttributeNames" : {
+                      "#key" : "key"
+                  },
+                  "ExpressionAttributeValues" : {
+                      ":key" : { "S" : key }
+                  }
+              }
+              
+              if child:
+                  kwargs["KeyConditionExpression"] += " AND begins_with(#child, :child)"
+                  kwargs["ExpressionAttributeNames"]["#child"] = "child"
+                  kwargs["ExpressionAttributeValues"][":child"] = { "S" : child }
+              
+              if marker:
+                  
+                  marker = marker[:-1] # Remove the trailing delimiter
+                  (marker_key, marker_child) = marker.rsplit(delimiter, 1) if delimiter in marker else [delimiter, marker]
+                  
+                  kwargs["ExclusiveStartKey"] = {
+                      "key" : {
+                          "S" : marker_key
+                      },
+                      "child" : {
+                          "S" : marker_child
+                      }
+                  }
+          
+              response = ddb.query(**kwargs)
+          
+              # Gather up the results
+              prefix = "" if key == delimiter else f'{key}{delimiter}'
+              results = [ { "prefix" : f'{prefix}{i["child"]["S"]}{delimiter}' } for i in response["Items"] ]
+              
+              # Form the next marker.
+              if "LastEvaluatedKey" in response:
+                  marker = f'{response["LastEvaluatedKey"]["key"]["S"]}{delimiter}{response["LastEvaluatedKey"]["child"]["S"]}{delimiter}'
+              else:
+                  marker = None
+              
+              return {
+                  "Results" : results,
+                  "Marker" : marker
+              }
+          
+          """
+          
+          Find the Common Prefixes beneath a given prefix, for V2
+          
+          """
+          
+          def find_common_prefixes_v2(prefix, delimiter, token, maxkeys):
+              
+              ddb = boto3.client("dynamodb")
+          
+              if prefix:
+                  # Split the prefix along the delimiter.
+                  (key, child) = prefix.rsplit(delimiter, 1) if delimiter in prefix else [delimiter, prefix]
+              
+              else:
+                  (key, child) = [delimiter, None]
+          
+              kwargs = {
+                  "TableName" : os.environ["CP_TABLE"],
+                  "Limit" : maxkeys,
+                  "ConsistentRead" : False,
+                  "KeyConditionExpression" : "#key = :key",
+                  "ExpressionAttributeNames" : {
+                      "#key" : "key"
+                  },
+                  "ExpressionAttributeValues" : {
+                      ":key" : { "S" : key }
+                  }
+              }
+              
+              if child:
+                  kwargs["KeyConditionExpression"] += " AND begins_with(#child, :child)"
+                  kwargs["ExpressionAttributeNames"]["#child"] = "child"
+                  kwargs["ExpressionAttributeValues"][":child"] = { "S" : child }
+              
+              if token: kwargs["ExclusiveStartKey"] = json.loads(b64decode(token).decode())
+              
+              response = ddb.query(**kwargs)
+          
+              # Gather up the results
+              prefix = "" if key == delimiter else f'{key}{delimiter}'
+              results = [ { "prefix" : f'{prefix}{i["child"]["S"]}{delimiter}' } for i in response["Items"] ]
+              
+              if "LastEvaluatedKey" in response:
+                  token = b64encode(bytes(json.dumps(response["LastEvaluatedKey"]), "utf-8")).decode()
+              else:
+                  token = None
+              
+              return {
+                  "Results" : results,
+                  "Token" : token
+              }
+
+  ObjectLambdaFunctionRole:
+    Type: "AWS::IAM::Role"
+    Condition: NotManifestOnly
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "logs:CreateLogGroup"
+                Resource: !Join [ ":", [ "arn:aws:logs", !Ref "AWS::Region", !Ref "AWS::AccountId", "*" ] ]
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Join [ "", [ "arn:", !Ref "AWS::Partition", ":logs:", !Ref "AWS::Region", ":", !Ref "AWS::AccountId", ":log-group:/aws/lambda/*" ] ]
+              - Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Query"
+                Resource:
+                  - !GetAtt CommonPrefixesDDBTable.Arn
+                  - !GetAtt KeyListDDBTable.Arn
+                  - !Join [ "", [ !GetAtt KeyListDDBTable.Arn, "/index/DepthIndex" ] ]
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                Resource:
+                  - !Join [ "", [ "arn:", !Ref "AWS::Partition", ":s3:::", !Ref BucketName, "/*" ] ]
+              - Effect: Allow
+                Action:
+                  - "s3-object-lambda:WriteGetObjectResponse"
+                Resource:
+                  - "*"
+
+
+Outputs:
+  OLAPBucketAlias:
+    Description: The Object Lambda Access Point bucket alias
+    Value: !GetAtt ObjectLambdaAccessPoint.Alias.Value
+    Condition: NotManifestOnly
+
+  ManifestLocation:
+    Description: Location of the Manifest for use with S3 Batch Operations
+    Value: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/Manifest/manifest.csv"]]
