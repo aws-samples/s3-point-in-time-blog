@@ -11,4 +11,4 @@ with Amazon S3 Object Lambda"](https://example.com/), we provide a snapshot-like
 
 ## Deploying
 
-This code repository contains the YAML file *[s3-pit.yaml](s3-pit.yaml)*, which is deployed via AWS CloudFormation. For full details on how to use the solution, please see [the blog post](https://example.com/).
+This code repository contains the YAML file *[s3-pit.yaml](s3-pit.yaml)*, which is deployed via AWS CloudFormation. For full details on how to use the solution, please see [the blog post](https://aws.amazon.com/blogs/storage/access-a-point-in-time-with-amazon-s3-object-lambda/).
