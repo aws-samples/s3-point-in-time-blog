@@ -5,14 +5,14 @@ Parameters:
   BucketName:
     Type: String
     Description: The Amazon S3 bucket name to be viewed at a Point in Time. Must have versioning enabled.
-    Default: "aws-pgargan-s3-pit-blog"
+    Default: ""
 
   TimeStamp:
     Type: String
     Description: The Point in Time timestamp required, in ISO format yyyy-mm-ddThh:mm:ss
     AllowedPattern: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\+\d{2}:\d{2})?
-    ConstraintDescription: Please enter a timestamp in ISO format, e.g. 2023-07-28T12:00:00
-    Default: "2023-07-28T12:00:00"
+    ConstraintDescription: Please enter a timestamp in ISO format, e.g. 2024-10-20T12:00:00
+    Default: "2024-10-20T12:00:00"
 
   Delimiter:
     Type: String
@@ -24,7 +24,7 @@ Parameters:
   Prefix:
     Type: String
     Description: Prefix to focus on. Leave blank for whole bucket.
-    Default: "demofiles/"
+    Default: ""
 
   ManifestOnly:
     Type: String
@@ -95,8 +95,9 @@ Resources:
                 reason = f"Bucket '{bucket}' does not exist."
               else:
                 reason = f"Error listing inventory configurations for bucket '{bucket}': {error.response['Error']['Message']}"
-                cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
-                return
+              
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+              return
             
             while True:
             
@@ -201,8 +202,8 @@ Resources:
                 Resource:
                   - "*"
 
-  FindInventory:
-    Type: "Custom::ExecuteFindInventoryFunction"
+  ExecuteInventoryFinder:
+    Type: "Custom::ExecuteInventoryFinderFunction"
     Properties:
       ServiceToken: !GetAtt InventoryFinder.Arn
       Bucket: !Ref BucketName
@@ -222,9 +223,9 @@ Resources:
           OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat'
           LOCATION '${InventoryLocation}'
           TBLPROPERTIES ( "projection.enabled" = "true", "projection.dt.type" = "date", "projection.dt.format" = "yyyy-MM-dd-HH-mm", "projection.dt.range" = "2020-01-01-00-00,NOW", "projection.dt.interval" = "1", "projection.dt.interval.unit" = "HOURS" )
-        - InventoryLocation: !GetAtt FindInventory.InventoryLocation
+        - InventoryLocation: !GetAtt ExecuteInventoryFinder.InventoryLocation
           GlueDB: !Ref GlueDatabase
-          Serde: !GetAtt FindInventory.Serde
+          Serde: !GetAtt ExecuteInventoryFinder.Serde
 
   CreateAllVersionsTable:
     Type: "AWS::Athena::NamedQuery"
@@ -234,7 +235,7 @@ Resources:
       QueryString: !Sub
         - |
           CREATE TABLE ${GlueDB}.all_versions WITH (format = 'ORC', external_location = 's3://${ResultsBucket}/all_versions_table/', write_compression = 'SNAPPY') AS SELECT key, version_id, is_delete_marker, to_iso8601(with_timezone(last_modified_date,'Z')) as last_modified_date, size, e_tag, storage_class, checksum_algorithm, object_owner FROM ${GlueDB}.pit_table WHERE dt = '${DateTime}' AND last_modified_date < from_iso8601_timestamp('${TimeStamp}') AND starts_with(key, '${Prefix}')
-        - DateTime: !GetAtt FindInventory.DateTime
+        - DateTime: !GetAtt ExecuteInventoryFinder.DateTime
           ResultsBucket: !Ref AthenaResultsBucket
           GlueDB: !Ref GlueDatabase
           TimeStamp: !Ref TimeStamp
@@ -271,7 +272,19 @@ Resources:
       Description: "Prepares a key manifest suitable for use with S3 Batch Operations"
       QueryString: !Sub
         - |
-          CREATE TABLE ${GlueDB}.manifest WITH (format = 'TEXTFILE', external_location = 's3://${ResultsBucket}/ManifestData/', field_delimiter = ',', write_compression = 'NONE') AS SELECT '${SourceBucket}' as bucket, url_encode(key) as key, version_id FROM ${GlueDB}.my_versions
+          CREATE TABLE ${GlueDB}.manifest WITH (format = 'TEXTFILE', external_location = 's3://${ResultsBucket}/ManifestData/', field_delimiter = ',', write_compression = 'NONE') AS SELECT '${SourceBucket}' as bucket, url_encode(key) as key, version_id FROM ${GlueDB}.my_versions WHERE size < BIGINT '5368709120' -- Less than 5GB
+        - ResultsBucket: !Ref AthenaResultsBucket
+          GlueDB: !Ref GlueDatabase
+          SourceBucket: !Ref BucketName
+
+  PrepareS3BatchManifest5GB:
+    Type: "AWS::Athena::NamedQuery"
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Prepares a key manifest suitable for use with S3 Batch Operations"
+      QueryString: !Sub
+        - |
+          CREATE TABLE ${GlueDB}.manifest5gb WITH (format = 'TEXTFILE', external_location = 's3://${ResultsBucket}/ManifestData5GB/', field_delimiter = ',', write_compression = 'NONE') AS SELECT '${SourceBucket}' as bucket, url_encode(key) as key, version_id FROM ${GlueDB}.my_versions WHERE size >= BIGINT '5368709120' -- Greater than or equal to 5GB
         - ResultsBucket: !Ref AthenaResultsBucket
           GlueDB: !Ref GlueDatabase
           SourceBucket: !Ref BucketName
@@ -353,7 +366,7 @@ Resources:
                   result_count = run_query(queries["Initial"], results_location)
                   
                   if result_count == 0:
-                      reason = "No data found in inventory table. Please confirm at least one inventory report is present."
+                      reason = "No files found. Please confirm the bucket name, prefix and timestamp."
                       cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
                       return
                   
@@ -565,6 +578,7 @@ Resources:
               
               query = athena.get_named_query(NamedQueryId = query_id)
               
+              print(f'Executing: {query["NamedQuery"]["QueryString"]}')
               response = athena.start_query_execution(
                   QueryString = query["NamedQuery"]["QueryString"],
                   ResultConfiguration = { "OutputLocation" : results_location }
@@ -582,8 +596,9 @@ Resources:
               (bucket, prefix) = results_location[5:].split("/", 1)
               
               # Remove metadata files so we just have CSVs to import.
+              print(f"Paginating s3://{bucket}/{prefix}")
               for p in s3.get_paginator("list_objects_v2").paginate(Bucket = bucket, Prefix = prefix):
-                  for c in p["Contents"]:
+                  for c in p.get("Contents", []):
                       
                       if c["Key"].endswith(".metadata"):
                           r = s3.delete_object(Bucket = bucket, Key = c["Key"])
@@ -732,29 +747,36 @@ Resources:
               result = re.search("^s3://(.+?)/(.+)", csv_location)
               bucket = result.group(1)
               prefix = result.group(2)
-              key = f"Manifest/manifest.csv"
+              dst_key = event["ResourceProperties"]["ManifestLocation"]
               
               session = boto3.session.Session()
               s3 = session.client("s3")
               
+              src_keys = []
+              combine_keys = []
+              found = False
+              for p in s3.get_paginator("list_objects_v2").paginate(Bucket = bucket, Prefix = prefix):
+                  for c in p.get("Contents", []):
+                      
+                      found = True
+                      if c["Size"] < 5*1024*1024:
+                          combine_keys += [ c["Key"] ]
+                      else:
+                          src_keys += [ c["Key"] ]
+              
+              if not found:
+                  response_data = { "Manifest" : "*** No matching files found ***" }
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+                  return
+                  
               try:
                   response = s3.create_multipart_upload(
                       Bucket = bucket,
-                      Key = key
+                      Key = dst_key
                   )
                   
                   upload_id = response["UploadId"]
                   
-                  src_keys = []
-                  combine_keys = []
-                  for p in s3.get_paginator("list_objects_v2").paginate(Bucket = bucket, Prefix = prefix):
-                      for c in p["Contents"]:
-                      
-                          if c["Size"] < 5*1024*1024:
-                              combine_keys += [ c["Key"] ]
-                          else:
-                              src_keys += [ c["Key"] ]
-          
                   # Combine any parts < 5MB into objects of at least 5MB.    
                   src_keys += combine(s3, bucket, prefix, combine_keys)
           
@@ -767,8 +789,8 @@ Resources:
                   part = 1
                   futures = []
                   executor = concurrent.futures.ThreadPoolExecutor(max_workers = len(src_keys))
-                  for k in src_keys:
-                      futures += [ executor.submit(upload_part, s3, bucket, key, { "Bucket" : bucket, "Key" : k } , part, upload_id) ]
+                  for key in src_keys:
+                      futures += [ executor.submit(upload_part, s3, bucket, dst_key, { "Bucket" : bucket, "Key" : key } , part, upload_id) ]
                       part += 1
               
                   parts = []
@@ -779,12 +801,12 @@ Resources:
               
                   response = s3.complete_multipart_upload(
                       Bucket = bucket,
-                      Key = key,
+                      Key = dst_key,
                       MultipartUpload = { "Parts" : parts },
                       UploadId = upload_id
                   )
               
-                  response_data = { "Manifest" : f"s3://{bucket}/{prefix}manifest.csv" }
+                  response_data = { "Manifest" : f"s3://{bucket}/{dst_key}" }
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
                   
               except botocore.exceptions.ClientError as e:
@@ -887,6 +909,16 @@ Resources:
       QueryID: !GetAtt PrepareS3BatchManifest.NamedQueryId
       ResultsLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/PrepareManifest/"]]
 
+  ExecutePrepareS3BatchManifest5GB:
+    Type: "Custom::ExecutePrepareS3BatchManifest5GBFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateMyVersionsTable
+    Properties:
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt PrepareS3BatchManifest5GB.NamedQueryId
+      ResultsLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/PrepareManifest5GB/"]]
+
   ExecuteManifestMaker:
     Type: "Custom::ExecuteManifestMakerFunction"
     DependsOn:
@@ -896,6 +928,18 @@ Resources:
     Properties:
       ServiceToken: !GetAtt ManifestMaker.Arn
       SourceLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/ManifestData/"]]
+      ManifestLocation: "Manifest/manifest.csv"
+
+  ExecuteManifestMaker5GB:
+    Type: "Custom::ExecuteManifestMaker5GBFunction"
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateMyVersionsTable
+    - ExecutePrepareS3BatchManifest5GB
+    Properties:
+      ServiceToken: !GetAtt ManifestMaker.Arn
+      SourceLocation: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/ManifestData5GB/"]]
+      ManifestLocation: "Manifest5GB/manifest.csv"
 
   KeyListDDBTable:
     Type: "AWS::DynamoDB::Table"
@@ -1790,6 +1834,20 @@ Outputs:
     Value: !GetAtt ObjectLambdaAccessPoint.Alias.Value
     Condition: NotManifestOnly
 
+  OLAPARN:
+    Description: The ARN of the Object Lambda Access Point
+    Value: !GetAtt ObjectLambdaAccessPoint.Arn
+    Condition: NotManifestOnly
+
+  LambdaRole:
+    Description: The ARN of the IAM Role used by the Lambda Function
+    Value: !GetAtt ObjectLambdaFunctionRole.Arn
+    Condition: NotManifestOnly
+
   ManifestLocation:
     Description: Location of the Manifest for use with S3 Batch Operations
-    Value: !Join [ "", [ "s3://", !Ref AthenaResultsBucket, "/Manifest/manifest.csv"]]
+    Value: !GetAtt ExecuteManifestMaker.Manifest
+
+  ManifestLocation5GBplus:
+    Description: Location of the Manifest for use with S3 Batch Operations, for files >= 5GB
+    Value: !GetAtt ExecuteManifestMaker5GB.Manifest
